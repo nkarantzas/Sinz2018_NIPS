@@ -3,7 +3,7 @@ from itertools import count
 from warnings import warn
 
 from torch import nn
-from torch.nn.init import xavier_normal
+from torch.nn.init import xavier_normal_ as xavier_normal
 import torch
 from torch.nn import functional as F, Parameter
 import torch.nn.init as init
@@ -11,13 +11,10 @@ from attorch.regularizers import LaplaceL23d, LaplaceL2
 from torch.autograd import Variable
 from attorch.layers import ExtendedConv2d
 from ..utils.logging import Messager
-
-try:
-    from netgard.flat_cajal import CajalUnit
-except:
-    warn("Could not import CajalUnit. You won't be able to use the NetGardCore")
-from attorch.layers import BiasBatchNorm2d, Elu1
+from attorch.layers import Elu1, BiasBatchNorm2d
 from attorch.module import ModuleDict
+
+from dynamic.utils.conv_rf import Conv2dRF
 
 
 class Core(Messager):
@@ -192,6 +189,83 @@ class NetGardCore(nn.Module, Messager):
 
 # ---------------------- Conv2d Cores -----------------------------
 
+# class Stacked2dCore(Core2d, nn.Module):
+#     def __init__(self, input_channels, hidden_channels, input_kern, hidden_kern, layers=3,
+#                  gamma_hidden=0, gamma_input=0., skip=0, final_nonlinearity=True, bias=False,
+#                  momentum=0.1, pad_input=True, batch_norm=True, **kwargs):
+#         self.msg('Ignoring input', kwargs, 'when creating', self.__class__.__name__)
+#         super().__init__()
+#         self._input_weights_regularizer = LaplaceL2()
+
+#         self.layers = layers
+#         self.gamma_input = gamma_input
+#         self.gamma_hidden = gamma_hidden
+#         self.input_channels = input_channels
+#         self.hidden_channels = hidden_channels
+
+#         self.skip = skip
+
+#         self.features = nn.Sequential()
+#         # --- first layer
+#         layer = OrderedDict()
+        
+#         layer['conv'] = nn.Conv2d(
+#             input_channels, 
+#             hidden_channels,
+#             input_kern, 
+#             padding=input_kern // 2 if pad_input else 0, 
+#             bias=False)
+
+#         if batch_norm:
+#             layer['norm'] = nn.BatchNorm2d(hidden_channels, momentum=momentum)
+#         if layers > 1 or final_nonlinearity:
+#             layer['nonlin'] = nn.ELU(inplace=True)
+#         self.features.add_module('layer0', nn.Sequential(layer))
+
+#         # --- other layers
+#         for l in range(1, self.layers):
+#             layer = OrderedDict()
+            
+#             layer['conv'] = nn.Conv2d(
+#                 hidden_channels if not skip > 1 else min(skip, l) * hidden_channels,
+#                 hidden_channels,
+#                 hidden_kern, 
+#                 padding=hidden_kern // 2, 
+#                 bias=False)
+
+#             if batch_norm:
+#                 layer['norm'] = nn.BatchNorm2d(hidden_channels, momentum=momentum)
+#             if final_nonlinearity or l < self.layers - 1:
+#                 layer['nonlin'] = nn.ELU(inplace=True)
+#             self.features.add_module('layer{}'.format(l), nn.Sequential(layer))
+
+#         self.apply(self.init_conv)
+
+#     def forward(self, input_):
+#         ret = []
+#         for l, feat in enumerate(self.features):
+#             do_skip = l >= 1 and self.skip > 1
+#             input_ = feat(input_ if not do_skip else torch.cat(ret[-min(self.skip, l):], dim=1))
+#             ret.append(input_)
+#         return torch.cat(ret, dim=1)
+
+#     def laplace(self):
+#         return self._input_weights_regularizer(self.features[0].conv.weight)
+
+#     def group_sparsity(self):
+#         ret = 0
+#         for l in range(1, self.layers):
+#             ret = ret + self.features[l].conv.weight.pow(2).sum(3, keepdim=True).sum(2, keepdim=True).sqrt().mean()
+#         return ret / ((self.layers - 1) if self.layers > 1 else 1)
+
+#     def regularizer(self):
+#         return self.group_sparsity() * self.gamma_hidden + self.gamma_input * self.laplace()
+
+#     @property
+#     def outchannels(self):
+#         return len(self.features) * self.hidden_channels
+
+
 class Stacked2dCore(Core2d, nn.Module):
     def __init__(self, input_channels, hidden_channels, input_kern, hidden_kern, layers=3,
                  gamma_hidden=0, gamma_input=0., skip=0, final_nonlinearity=True, bias=False,
@@ -211,9 +285,14 @@ class Stacked2dCore(Core2d, nn.Module):
         self.features = nn.Sequential()
         # --- first layer
         layer = OrderedDict()
-        layer['conv'] = \
-            nn.Conv2d(input_channels, hidden_channels, input_kern,
-                      padding=input_kern // 2 if pad_input else 0, bias=bias)
+        
+        layer['conv'] = Conv2dRF(
+            input_channels, 
+            hidden_channels,
+            input_kern, 
+            padding=input_kern // 2 if pad_input else 0, 
+            bias=False)
+
         if batch_norm:
             layer['norm'] = nn.BatchNorm2d(hidden_channels, momentum=momentum)
         if layers > 1 or final_nonlinearity:
@@ -223,10 +302,14 @@ class Stacked2dCore(Core2d, nn.Module):
         # --- other layers
         for l in range(1, self.layers):
             layer = OrderedDict()
-            layer['conv'] = \
-                nn.Conv2d(hidden_channels if not skip > 1 else min(skip, l) * hidden_channels,
-                          hidden_channels, hidden_kern,
-                          padding=hidden_kern // 2, bias=bias)
+            
+            layer['conv'] = Conv2dRF(
+                hidden_channels if not skip > 1 else min(skip, l) * hidden_channels,
+                hidden_channels,
+                hidden_kern, 
+                padding=hidden_kern // 2, 
+                bias=False)
+
             if batch_norm:
                 layer['norm'] = nn.BatchNorm2d(hidden_channels, momentum=momentum)
             if final_nonlinearity or l < self.layers - 1:
@@ -244,12 +327,12 @@ class Stacked2dCore(Core2d, nn.Module):
         return torch.cat(ret, dim=1)
 
     def laplace(self):
-        return self._input_weights_regularizer(self.features[0].conv.weight)
+        return self._input_weights_regularizer(self.features[0].conv.kernel)
 
     def group_sparsity(self):
         ret = 0
         for l in range(1, self.layers):
-            ret = ret + self.features[l].conv.weight.pow(2).sum(3, keepdim=True).sum(2, keepdim=True).sqrt().mean()
+            ret = ret + self.features[l].conv.kernel.pow(2).sum(3, keepdim=True).sum(2, keepdim=True).sqrt().mean()
         return ret / ((self.layers - 1) if self.layers > 1 else 1)
 
     def regularizer(self):
@@ -262,8 +345,15 @@ class Stacked2dCore(Core2d, nn.Module):
 
 class LinearCore(Stacked2dCore):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, layers=1, skip=0, final_nonlinearity=False, bias=False,
-                         hidden_kern=0, gamma_hidden=0)
+        super().__init__(
+        	*args, 
+        	**kwargs, 
+        	layers=1, 
+        	skip=0, 
+        	final_nonlinearity=False, 
+        	bias=False,
+        	hidden_kern=0, 
+        	gamma_hidden=0)
 
 
 # ---------------------- Conv3d Core -----------------------------
@@ -437,7 +527,7 @@ class RNNCore:
         if isinstance(m, nn.Conv2d):
             xavier_normal(m.weight.data)
             if m.bias is not None:
-                init.constant(m.bias.data, 0.)
+                init.constant_(m.bias.data, 0.)
 
     def __repr__(self):
         s = super().__repr__()
@@ -464,15 +554,15 @@ class ConvGRUCell(RNNCore, nn.Module, Messager):
         self._shrinkage = 0 if pad_input else input_kern - 1
 
         self.gamma_rec = gamma_rec
+
+        ### Non DRF Convolution
         self.reset_gate_input = nn.Conv2d(input_channels, rec_channels, input_kern, padding=input_padding)
         self.reset_gate_hidden = nn.Conv2d(rec_channels, rec_channels, rec_kern, padding=rec_padding)
-
         self.update_gate_input = nn.Conv2d(input_channels, rec_channels, input_kern, padding=input_padding)
         self.update_gate_hidden = nn.Conv2d(rec_channels, rec_channels, rec_kern, padding=rec_padding)
-
         self.out_gate_input = nn.Conv2d(input_channels, rec_channels, input_kern, padding=input_padding)
         self.out_gate_hidden = nn.Conv2d(rec_channels, rec_channels, rec_kern, padding=rec_padding)
-
+        
         self.apply(self.init_conv)
         self.register_parameter('_prev_state', None)
 
@@ -495,13 +585,13 @@ class ConvGRUCell(RNNCore, nn.Module, Messager):
             prev_state = self.init_state(input_)
 
         update = self.update_gate_input(input_) + self.update_gate_hidden(prev_state)
-        update = F.sigmoid(update)
+        update = torch.sigmoid(update)
 
         reset = self.reset_gate_input(input_) + self.reset_gate_hidden(prev_state)
-        reset = F.sigmoid(reset)
+        reset = torch.sigmoid(reset)
 
         out = self.out_gate_input(input_) + self.out_gate_hidden(prev_state * reset)
-        h_t = F.tanh(out)
+        h_t = torch.tanh(out)
         new_state = prev_state * (1 - update) + h_t * update
 
         return new_state
